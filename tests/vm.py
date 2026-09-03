@@ -74,6 +74,9 @@ class VMTest(RiftTestCase):
         self.assertFalse(vm.copymode)
         self.assertIsNone(vm._vm)
         self.assertIsNone(vm._tmpimg)
+        self.assertEqual(
+            os.path.basename(vm.image_tmp), f"rift-vm-img-{vm.vmid}.qcow2"
+        )
         self.assertIsNone(vm.kernel)
 
         # arch specific
@@ -187,6 +190,60 @@ class VMTest(RiftTestCase):
             RiftError, "^Unsupported VM image URL scheme fail$"
         ):
             _ = vm.image_local
+
+    def test_save(self):
+        """Test saving a running VM temporary image."""
+        output_file = make_temp_file("base", delete=False)
+        output_file.close()
+        self.addCleanup(
+            lambda: os.path.exists(output_file.name) and os.unlink(output_file.name)
+        )
+        self.config.set("vm", {"image": output_file.name})
+        vm = VM(self.config, platform.machine())
+        self.addCleanup(
+            lambda: os.path.exists(vm.image_tmp) and os.unlink(vm.image_tmp)
+        )
+        with open(vm.image_tmp, "w", encoding="utf-8") as fh:
+            fh.write("overlay")
+        vm.running = Mock(side_effect=[True, False])
+        vm.cmd = Mock()
+        vm._write_tmp_image_output = Mock()
+
+        self.assertEqual(vm.save(output_file.name), output_file.name)
+
+        vm.cmd.assert_called_once_with("sync; poweroff")
+        vm._write_tmp_image_output.assert_called_once_with(output_file.name)
+        self.assertFalse(os.path.exists(vm.image_tmp))
+
+    def test_save_no_tmp_image(self):
+        """Test saving VM image without temporary image."""
+        output_file = make_temp_file("base", delete=False)
+        output_file.close()
+        self.addCleanup(
+            lambda: os.path.exists(output_file.name) and os.unlink(output_file.name)
+        )
+        self.config.set("vm", {"image": output_file.name})
+        vm = VM(self.config, platform.machine())
+        if os.path.exists(vm.image_tmp):
+            os.unlink(vm.image_tmp)
+
+        with self.assertRaisesRegex(
+            RiftError,
+            "^No temporary VM image found to save, "
+            "was the VM started with --notemp\\?$",
+        ):
+            vm.save(output_file.name)
+
+    def test_save_without_output(self):
+        """Test saving VM image requires output."""
+        self.config.set("vm", {"image": "/tmp/image.qcow2"})
+        vm = VM(self.config, platform.machine())
+
+        with self.assertRaisesRegex(
+            RiftError,
+            "^VM save output must be specified with -o, --output option$",
+        ):
+            vm.save()
 
     def test_image_is_remote(self):
         expected_values = {

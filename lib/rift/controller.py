@@ -384,6 +384,13 @@ def make_parser():
         help="modify the real VM image",
     )
     subprs_vm.add_parser("stop", help="stop the running VM")
+    subsubprs = subprs_vm.add_parser("save", help="save the running VM image")
+    subsubprs.add_argument(
+        "-o",
+        "--output",
+        required=True,
+        help="path of saved virtual machine image",
+    )
     subprs_vm.add_parser("console", help="console of the running VM")
     subsubprs = subprs_vm.add_parser("cmd", help="run a command inside the VM")
     subsubprs.add_argument(
@@ -824,6 +831,7 @@ def action_vm(args, config):
         "cmd",
         "copy",
         "build",
+        "save",
     )
     supported_archs = config.get("arch")
     if args.arch is None:
@@ -854,6 +862,10 @@ def action_vm(args, config):
             ret = 0
     elif args.vm_cmd == "stop":
         ret = vm.cmd("poweroff").returncode
+    elif args.vm_cmd == "save":
+        output = vm.save(output=args.output)
+        banner(f"VM image {output} saved")
+        ret = 0
     elif args.vm_cmd == "build":
         ret = vm_build(config, vm, args)
     return ret

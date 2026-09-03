@@ -2490,6 +2490,15 @@ class ControllerProjectActionVMTest(RiftProjectTestCase):
         mock_vm.connect.assert_called_once_with(proxy=False)
 
     @patch("rift.controller.VM")
+    def test_action_vm_save(self, mock_vm_class):
+        """simple 'rift vm save' calls VM.save()"""
+        mock_vm = mock_vm_class.return_value
+        mock_vm.save.return_value = "OUTPUT.img"
+
+        self.assertEqual(main(["vm", "save", "--output", "OUTPUT.img"]), 0)
+        mock_vm.save.assert_called_once_with(output="OUTPUT.img")
+
+    @patch("rift.controller.VM")
     def test_action_vm_build(self, mock_vm_class):
         """simple 'rift vm build' is ok"""
 
@@ -3649,6 +3658,16 @@ class ControllerArgumentsTest(RiftTestCase):
         opts = parser.parse_args(args)
         self.assertEqual(opts.vm_cmd, "connect")
 
+        with self.assertRaises(SystemExit):
+            parser.parse_args(["vm", "save"])
+
+        OUTPUT_IMG = "OUTPUT"
+
+        args = ["vm", "save", "-o", OUTPUT_IMG]
+        opts = parser.parse_args(args)
+        self.assertEqual(opts.vm_cmd, "save")
+        self.assertEqual(opts.output, OUTPUT_IMG)
+
         args = ["vm", "build", "--url", "http://image"]
         opts = parser.parse_args(args)
         self.assertEqual(opts.vm_cmd, "build")
@@ -3662,8 +3681,6 @@ class ControllerArgumentsTest(RiftTestCase):
         args = ["vm", "build", "--url", "http://image", "--deploy"]
         opts = parser.parse_args(args)
         self.assertTrue(opts.deploy)
-
-        OUTPUT_IMG = "OUTPUT"
 
         args = ["vm", "build", "--url", "http://image", "-o", OUTPUT_IMG]
         opts = parser.parse_args(args)

@@ -229,6 +229,13 @@ class VM:
             f"rift-vm-local-image-{self.vmid}_{os.path.basename(self._image_src.path)}",
         )
 
+    @property
+    def image_tmp(self) -> str:
+        """
+        Return deterministic path of temporary VM image used while VM is running.
+        """
+        return os.path.join(tempfile.gettempdir(), f"rift-vm-img-{self.vmid}.qcow2")
+
     def image_is_remote(self) -> bool:
         """
         Return True if VM image URL is an HTTP(S) URL, False if local file or raise
@@ -291,10 +298,11 @@ class VM:
     def _mk_tmp_img(self, image):
         """Create a temp VM image to avoid modifying the real image disk."""
 
-        # Create a temporary file for VM image
-        # XXX: Maybe a mkstemp() is better here to avoid removing file
-        # when VM process is not stopped in purpose
-        self._tmpimg = tempfile.NamedTemporaryFile(prefix="rift-vm-img-")
+        # Create a temporary file for VM image. The path must be stable because
+        # rift vm save runs in a distinct process after rift vm start.
+        if os.path.exists(self.image_tmp):
+            os.unlink(self.image_tmp)
+        self._tmpimg = open(self.image_tmp, "w+b")
 
         if self.copymode:
             # Copy qcow image for VM, based on temp file
@@ -311,6 +319,7 @@ class VM:
         with Popen(cmd, stdout=PIPE, stderr=STDOUT, universal_newlines=True) as popen:
             stdout = popen.communicate()[0]
             if popen.returncode != 0:
+                self.unlink()
                 raise RiftError(stdout)
 
     def _make_drive_cmd(self):
@@ -863,10 +872,26 @@ class VM:
         """
         Remove temporary image if used.
         """
+        tmpimg_path = self.image_tmp
         if self._tmpimg and not self._tmpimg.closed:
-            logging.debug("Unlink VM temporary image file '%s'", self._tmpimg.name)
+            tmpimg_path = self._tmpimg.name
+            logging.debug("Closing VM temporary image file '%s'", tmpimg_path)
             self._tmpimg.close()
             self._tmpimg = None
+        if os.path.exists(tmpimg_path):
+            logging.debug("Unlink VM temporary image file '%s'", tmpimg_path)
+            os.unlink(tmpimg_path)
+
+    def _wait_stopped(self, timeout=60):
+        """
+        Wait until VM is stopped.
+        """
+        end_time = time.time() + timeout
+        while time.time() < end_time:
+            if not self.running():
+                return True
+            time.sleep(1)
+        return False
 
     def start(self, force: bool):
         """
@@ -900,6 +925,14 @@ class VM:
         # wait for the VM to restart or fail after timeout
         if not self.ready():
             raise RiftError("Failed to restart VM")
+
+    def _current_tmp_image(self):
+        """
+        Return path of current VM temporary image.
+        """
+        if self._tmpimg and not self._tmpimg.closed:
+            return self._tmpimg.name
+        return self.image_tmp
 
     def _dl_base_image(self, url, force):
         """
@@ -1032,17 +1065,40 @@ class VM:
                 self.stop()
                 raise RiftError("Error while running build post script")
 
-    def _build_write_output(self, output):
+    @staticmethod
+    def _qemu_image_is_locked(error):
         """
-        Write built VM image in output.
+        Return True when qemu-img failed because another process locks the image.
         """
-        if self.copymode:
-            # In copymode, just copy the image file to its resulting name
-            shutil.copy(self._tmpimg.name, output)
-        else:
-            # If an overlay over the cloud image was used, convert it to a full
-            # image with qemu-img.
-            try:
+        output = "\n".join(
+            item for item in (error.stdout, error.stderr, error.output) if item
+        )
+        return (
+            'Failed to get shared "write" lock' in output
+            or "Is another process using the image" in output
+        )
+
+    def _write_tmp_image_output_once(self, output):
+        """
+        Write temporary VM image in output.
+        """
+        tmp_output = None
+        output_dir = os.path.dirname(os.path.abspath(output))
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{os.path.basename(output)}.",
+                dir=output_dir,
+                delete=False,
+            ) as tmp_file:
+                tmp_output = tmp_file.name
+            os.unlink(tmp_output)
+
+            if self.copymode:
+                # In copymode, just copy the image file to its resulting name
+                shutil.copy(self._current_tmp_image(), tmp_output)
+            else:
+                # If an overlay over the base image was used, convert it to a
+                # full image with qemu-img.
                 run(
                     [
                         "qemu-img",
@@ -1050,15 +1106,79 @@ class VM:
                         "-c",
                         "-O",
                         "qcow2",
-                        self._tmpimg.name,
-                        output,
+                        self._current_tmp_image(),
+                        tmp_output,
                     ],
                     check=True,
+                    stdout=PIPE,
+                    stderr=PIPE,
+                    text=True,
                 )
+            os.replace(tmp_output, output)
+            tmp_output = None
+        finally:
+            if tmp_output and os.path.exists(tmp_output):
+                os.unlink(tmp_output)
+
+    def _write_tmp_image_output(self, output, timeout=60):
+        """
+        Write temporary VM image in output, waiting for qemu to release it if needed.
+        """
+        end_time = time.time() + timeout
+        while True:
+            try:
+                self._write_tmp_image_output_once(output)
+                return
             except CalledProcessError as error:
+                if self._qemu_image_is_locked(error) and time.time() < end_time:
+                    logging.debug(
+                        "VM image %s is still locked, retrying conversion",
+                        self._current_tmp_image(),
+                    )
+                    time.sleep(1)
+                    continue
+                details = (error.stderr or error.stdout or str(error)).strip()
+                if details:
+                    raise RiftError(
+                        f"Error while converting resulting image: {details}"
+                    ) from error
                 raise RiftError(
                     f"Error while converting resulting image: {str(error)}"
                 ) from error
+
+    def _build_write_output(self, output):
+        """
+        Write built VM image in output.
+        """
+        if not self._tmpimg:
+            raise RiftError("No temporary VM image found to write")
+        self._write_tmp_image_output(output)
+
+    def save(self, output=None):
+        """
+        Stop running VM if needed and save its temporary image.
+        """
+        if output is None:
+            raise RiftError(
+                "VM save output must be specified with -o, --output option"
+            )
+
+        if not os.path.exists(self._current_tmp_image()):
+            raise RiftError(
+                "No temporary VM image found to save, "
+                "was the VM started with --notemp?"
+            )
+
+        if self.running():
+            message("Stopping VM ...")
+            self.cmd("sync; poweroff")
+            if not self._wait_stopped():
+                raise RiftError("Failed to stop VM")
+
+        logging.info("Saving VM image %s", output)
+        self._write_tmp_image_output(output)
+        self.unlink()
+        return output
 
     def build(self, url, force, keep, output):
         """
